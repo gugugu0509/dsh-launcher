@@ -1,0 +1,9 @@
+# 运行产物（不入库）
+logs/
+dsh.pid
+*.log
+
+# 系统
+Thumbs.db
+Desktop.ini
+.DS_Store
