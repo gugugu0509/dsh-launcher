@@ -2,6 +2,15 @@
 logs/
 dsh.pid
 *.log
+*.bak
+*.tmp
+
+# 第三方角色素材：本仓库不含，需你自备（见 README「图标与素材」）
+assets/
+fish-desktop.png
+
+# 生成的图标（首次运行会重新生成）
+dsh.ico
 
 # 系统
 Thumbs.db
