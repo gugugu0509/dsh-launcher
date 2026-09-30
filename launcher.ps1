@@ -30,6 +30,27 @@ $IconPath    = Join-Path $LauncherDir 'dsh.ico'
 $UsageScript = Join-Path $LauncherDir 'usage.js'
 $UsageResult = Join-Path $LogDir 'usage-result.json'
 
+# dsh 入口（打包版 bin.js）与版本清单（启动与界面显示版本共用同一来源）
+#   ① 环境变量 DSH_BIN 指定；② 否则从启动器目录向上/同级自动查找
+#      <任意目录>\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js；③ 都没有则回退 pnpm 源码启动
+$DshBin = $env:DSH_BIN
+if (-not $DshBin -or -not (Test-Path $DshBin)) {
+    $DshBin = $null
+    $probe = $LauncherDir
+    for ($i = 0; $i -lt 6 -and -not $DshBin; $i++) {
+        $cand = Join-Path $probe 'dsh\node_modules\@deepseek-ai\dsh\lib\bin.js'
+        if (Test-Path $cand) { $DshBin = $cand; break }
+        $kid = Get-ChildItem $probe -Directory -ErrorAction SilentlyContinue |
+               ForEach-Object { Join-Path $_.FullName 'dsh\node_modules\@deepseek-ai\dsh\lib\bin.js' } |
+               Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($kid) { $DshBin = $kid; break }
+        $parent = Split-Path -Parent $probe
+        if (-not $parent -or $parent -eq $probe) { break }
+        $probe = $parent
+    }
+}
+$DshPkgJson = if ($DshBin) { Join-Path (Split-Path (Split-Path $DshBin -Parent) -Parent) 'package.json' } else { '' }
+
 # 大肥鱼吃白饭 —— 人物素材（透明 PNG，来源见 README）
 $FishFront   = Join-Path $LauncherDir 'assets\front.png'   # 大肥鱼正面立绘（界面展示）
 $FishIcon    = Join-Path $LauncherDir 'assets\icon.png'    # 大肥鱼头像（窗口图标）
@@ -129,7 +150,7 @@ function Test-DshRunning {
 
 function Get-TokenUrl {
     # 从日志里提取带 token 的完整地址；找不到就退回根地址。
-    # 自己的日志优先；再回退到 E 盘共享启动日志（外部/一键脚本启动的实例 token 在那）。
+    # 自己的日志优先；可用环境变量 DSH_EXTRA_LOGS 追加外部启动实例的日志（token 地址在那里）。
     # 额外日志（例如由外部脚本启动的实例）可用环境变量 DSH_EXTRA_LOGS 指定，多个路径用 ; 分隔
     $extra = @()
     if ($env:DSH_EXTRA_LOGS) { $extra = @($env:DSH_EXTRA_LOGS -split ';' | Where-Object { $_ -and (Test-Path $_) }) }
@@ -167,11 +188,8 @@ function Adopt-RunningDsh {
 
 function Start-Dsh {
     if (Test-DshRunning) { return $false }   # 已在运行
-    # 清空 WorkBuddy 劫持环境，避免 dsh 启动时被杀
+    # 清空可能劫持 node 的环境变量（部分工具会注入，导致 dsh 启动即被杀）
     $env:NODE_OPTIONS=''; $env:ELECTRON_RUN_AS_NODE=''
-    $env:CODEBUDDY_SAFE_DELETE_ENABLED=''; $env:CODEBUDDY_SAFE_DELETE_BULK_GUARD=''
-    $env:CODEBUDDY_SAFE_DELETE_SANDBOX=''; $env:CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR=''
-    $env:CODEBUDDY_SAFE_DELETE_BIN_DIR=''; $env:CODEBUDDY_NODE_BIN=''
     # 如需指定数据目录，请在启动前设置 DSH_HOME（这里不再硬编码）
 
     # 清空旧日志，确保本次启动的日志是干净的
@@ -179,20 +197,20 @@ function Start-Dsh {
     Set-Content -Path $ErrLog -Value '' -Encoding UTF8 -ErrorAction SilentlyContinue
 
     # 启动方式（二选一）：
-    #   ① 设了 DSH_BIN（指向打包版 .../@deepseek-ai/dsh/lib/bin.js）→ 用 node 直接起
+    #   ① 找到或指定了打包版 bin.js → 用 node 直接起（DSH_NODE 可指定 node 路径）
     #   ② 否则在 DSH 源码目录用 pnpm dsh web 启动
-    $bin = $env:DSH_BIN
-    if ($bin -and (Test-Path $bin)) {
+    $proc = $null
+    if ($DshBin) {
         $node = if ($env:DSH_NODE) { $env:DSH_NODE } else { 'node' }
         $proc = Start-Process -FilePath $node `
-            -ArgumentList @($bin, 'web', '--no-open') `
+            -ArgumentList @($DshBin, 'web', '--no-open') `
             -RedirectStandardOutput $OutLog `
             -RedirectStandardError $ErrLog `
             -WindowStyle Hidden `
             -PassThru
     } else {
         if (-not $ResolvedHarness) {
-            throw '未找到 DSH 源码目录：请用 -HarnessDir / DSH_HARNESS_DIR 指定，或设置 DSH_BIN 指向打包版 bin.js。'
+            throw '未找到 dsh：请设置 DSH_BIN 指向打包版 bin.js，或用 -HarnessDir / DSH_HARNESS_DIR 指定源码目录。'
         }
         $proc = Start-Process -FilePath 'cmd.exe' `
             -ArgumentList '/c', 'pnpm dsh web --no-open' `
@@ -268,31 +286,38 @@ function Format-Tokens {
     return ('{0:N0}' -f $n)
 }
 
-function Get-Usage {
-    # 运行 usage.js，返回解析后的对象；失败返回 $null。
-    # 用带超时的异步进程启动，避免 node 卡住阻塞 UI 线程。
-    if (-not (Test-Path $UsageScript)) { return $null }
+function Read-UsageResult {
+    # 只读取 usage.js 写出的结果文件并解析，不运行脚本、不阻塞 UI。
+    if (-not (Test-Path $UsageResult)) { return $null }
+    try {
+        $content = Get-Content $UsageResult -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ($content) { return ($content | ConvertFrom-Json) }
+    } catch { }
+    return $null
+}
+
+function Start-UsageQuery {
+    # 后台启动 node usage.js，不等待、不设超时、不杀进程。
+    #
+    # 曾经的故障：这里用 WaitForExit(5000) 同步等待，超时就 Kill。会话日志累积到
+    # 82 个、108 MB 后，usage.js 全量汇总需要 7.6 秒 > 5 秒，进程每次都被杀在写结果
+    # 之前，于是余额面板永远显示「查询失败」。真正的余额接口只要 0.3 秒，是被排在
+    # 耗时的 token 汇总后面才一起遭殃的。现在改为：后台跑 + 轮询结果文件。
+    if ($script:usageProc -and -not $script:usageProc.HasExited) { return }
+    if (-not (Test-Path $UsageScript)) { return }
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = 'node'
-        # 参数用双引号包裹路径（路径含空格时必需），不要多加引号
+        # 必须用双引号包裹路径：ProcessStartInfo 不经过 shell，单引号会被当成
+        # 路径的一部分（曾导致 node 报 MODULE_NOT_FOUND）。
         $psi.Arguments = ('"{0}" "{1}"' -f $UsageScript, $UsageResult)
         $psi.WorkingDirectory = $LauncherDir
         $psi.UseShellExecute = $false
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
         $psi.CreateNoWindow = $true
-        $proc = [System.Diagnostics.Process]::Start($psi)
-        if (-not $proc.WaitForExit(5000)) {   # 5 秒超时
-            try { $proc.Kill() } catch { }
-            return $null
-        }
-        if (Test-Path $UsageResult) {
-            $content = Get-Content $UsageResult -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-            if ($content) { return ($content | ConvertFrom-Json) }
-        }
-        return $null
-    } catch { return $null }
+        $script:usageProc = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        $script:usageProc = $null
+    }
 }
 
 # ----------------------------------------------------------------- 图标 -----
@@ -381,7 +406,9 @@ $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 $form.BackColor = $Bg
 $form.ForeColor = $Fg
 $form.MinimumSize = New-Object System.Drawing.Size 480, 520
-if ($IconPath) { $form.Icon = New-Object System.Drawing.Icon $IconPath }
+if ($IconPath -and (Test-Path -LiteralPath $IconPath)) {
+    try { $form.Icon = New-Object System.Drawing.Icon $IconPath } catch { }   # 图标缺失/损坏不影响启动
+}
 
 # 注意：不再设置 TopMost。置顶会让启动器永久浮在最上层、挡住其他窗口，
 # 用户已反馈困扰。窗口本身可正常拖动（UI 线程阻塞已修复）。
@@ -558,17 +585,17 @@ $form.Controls.Add($pnlPrice)
 
 # 标题行
 $lblPriceTitle = New-Object System.Windows.Forms.Label
-$lblPriceTitle.Text = 'API 价格 · 峰谷定价（2026-08-17 起生效）'
+$lblPriceTitle.Text = 'API 价格 · 峰谷定价（V4.1-Flash 降价后 · 2026-09-10）'
 $lblPriceTitle.Font = New-Object System.Drawing.Font 'Microsoft YaHei UI', 8.5, ([System.Drawing.FontStyle]::Bold)
 $lblPriceTitle.ForeColor = $Fg
 $lblPriceTitle.Location = New-Object System.Drawing.Point 10, 6
-$lblPriceTitle.Size = New-Object System.Drawing.Size 300, 18
+$lblPriceTitle.Size = New-Object System.Drawing.Size 496, 18
 $pnlPrice.Controls.Add($lblPriceTitle)
 
 # Flash 行（峰谷定价：空闲/高峰）
 $lblFlashCap = New-Object System.Windows.Forms.Label
-$lblFlashCap.Text = 'v4-flash  输出 4.5/9元 · 输入 1.5/3元 · 命中 0.05/0.1元'
-$lblFlashCap.Font = New-Object System.Drawing.Font 'Microsoft YaHei UI', 8
+$lblFlashCap.Text = 'deepseek-flash   输出 4/8元 · 输入 1/2元 · 命中 0.02/0.04元'
+$lblFlashCap.Font = New-Object System.Drawing.Font 'Microsoft YaHei UI', 7.5
 $lblFlashCap.ForeColor = $Muted
 $lblFlashCap.Location = New-Object System.Drawing.Point 10, 28
 $lblFlashCap.Size = New-Object System.Drawing.Size 340, 18
@@ -586,8 +613,8 @@ $pnlPrice.Controls.Add($lblFlashEst)
 
 # Pro 行（峰谷定价：空闲/高峰）
 $lblProCap = New-Object System.Windows.Forms.Label
-$lblProCap.Text = 'v4-pro   输出 13.5/27元 · 输入 4.5/9元 · 命中 0.15/0.3元'
-$lblProCap.Font = New-Object System.Drawing.Font 'Microsoft YaHei UI', 8
+$lblProCap.Text = 'deepseek-v4-pro  输出 13.5/27元 · 输入 4.5/9元 · 命中 0.15/0.3元'
+$lblProCap.Font = New-Object System.Drawing.Font 'Microsoft YaHei UI', 7.5
 $lblProCap.ForeColor = $Muted
 $lblProCap.Location = New-Object System.Drawing.Point 10, 50
 $lblProCap.Size = New-Object System.Drawing.Size 340, 18
@@ -669,6 +696,8 @@ $script:openedBrowser = $false   # 本次会话是否已自动打开过浏览器
 $script:lastLogText  = ''        # 上次日志内容，用于增量刷新
 $script:usageTick    = 0         # 用量刷新计数器
 $script:usageLoaded  = $false    # 是否已成功加载过一次用量
+$script:usageProc    = $null     # 正在后台运行的 usage.js 进程
+$script:usageStamp   = $null     # 结果文件上次生效的写入时间（用于判断是否有新结果）
 $script:startingDsh  = $false    # 启动中标记（防重复点击重复拉起进程树）
 $script:startedAt    = [DateTime]::UtcNow
 
@@ -706,9 +735,9 @@ function Refresh-Log {
 }
 
 function Apply-Usage {
-    # 执行一次用量查询并刷新界面显示（余额 + token）。
-    # 手动刷新按钮和定时刷新都调用它。
-    $u = Get-Usage
+    # 读取最近一次查询结果并刷新界面显示（余额 + token）。
+    # 由定时器在结果文件更新后调用，不自己发起查询。
+    $u = Read-UsageResult
     if ($null -eq $u) {
         if (-not $script:usageLoaded) {
             $lblBalance.Text = '查询失败'
@@ -736,12 +765,13 @@ function Apply-Usage {
     $bal = 0.0
     if ($u.balance -and $u.balance.available) { $bal = [double]$u.balance.total }
     if ($bal -gt 0) {
-        # v4-flash 输出：高峰 9 元 / 空闲 4.5 元（每百万 token）
-        $flashPeak = $bal / 9.0 * 1e6
-        $flashOff  = $bal / 4.5 * 1e6
+        # deepseek-flash（V4.1-Flash）输出：高峰 8 元 / 空闲 4 元（每百万 token）
+        # 2026-09-10 V4.1-Flash 上线后官方降价，旧价（高峰 9 / 空闲 4.5）已作废
+        $flashPeak = $bal / 8.0 * 1e6
+        $flashOff  = $bal / 4.0 * 1e6
         $lblFlashEst.Text = ('≈ {0} 输出token（空闲 {1}）' -f (Format-Tokens $flashPeak), (Format-Tokens $flashOff))
         $lblFlashEst.ForeColor = $Green
-        # v4-pro 输出：高峰 27 元 / 空闲 13.5 元（每百万 token）
+        # deepseek-v4-pro 输出：高峰 27 元 / 空闲 13.5 元（每百万 token，未变动）
         $proPeak = $bal / 27.0 * 1e6
         $proOff  = $bal / 13.5 * 1e6
         $lblProEst.Text = ('≈ {0} 输出token（空闲 {1}）' -f (Format-Tokens $proPeak), (Format-Tokens $proOff))
@@ -769,12 +799,38 @@ function Apply-Usage {
 }
 
 function Update-Usage {
-    # 定时刷新：每隔约 10 秒执行一次用量查询（余额 + token）
-    $script:usageTick++
-    if ($script:usageTick -lt 5) { return }   # 2s * 5 ≈ 10s
-    $script:usageTick = 0
+    # 定时刷新用量：后台发起查询 + 轮询结果文件，全程不阻塞 UI 线程。
 
-    Apply-Usage
+    # 每约 10 秒发起一次查询（若上一次还没跑完则跳过，不叠加进程）
+    $script:usageTick++
+    if ($script:usageTick -ge 5) {   # 2s * 5 ≈ 10s
+        $script:usageTick = 0
+        Start-UsageQuery
+    }
+
+    # 结果文件有更新就刷新界面。
+    # usage.js 分两段写：先写余额（~0.3s），再写含 token 的完整结果；
+    # 所以这里能很快先把余额显示出来，不必等耗时的 token 汇总跑完。
+    if (Test-Path $UsageResult) {
+        $stamp = $null
+        try { $stamp = (Get-Item $UsageResult).LastWriteTimeUtc } catch { }
+        if ($stamp -and $stamp -ne $script:usageStamp) {
+            $script:usageStamp = $stamp
+            Apply-Usage
+        }
+    }
+
+    # 查询进程结束后收尾（恢复刷新按钮）
+    if ($script:usageProc) {
+        $done = $false
+        try { $done = $script:usageProc.HasExited } catch { $done = $true }
+        if ($done) {
+            try { $script:usageProc.Dispose() } catch { }
+            $script:usageProc = $null
+            $btnRefresh.Text = '刷新'
+            $btnRefresh.Enabled = $true
+        }
+    }
 }
 
 function On-Tick {
@@ -808,7 +864,9 @@ $btnStart.Add_Click({
     $lblStatus.Text = '●  启动中…'
     $lblStatus.ForeColor = $Yellow
     $txtLog.AppendText("`r`n=== 正在启动 DeepSeek Harness ... ===`r`n")
-    $txtLog.AppendText("版本: E 盘打包版 0.1.2-rc.1 (DSH_HOME=E)`r`n")
+    # 版本号实时读取 dsh 的 package.json（写死会与实际运行版本不符）
+    $dshVer = try { (Get-Content $DshPkgJson -Raw -ErrorAction Stop | ConvertFrom-Json).version } catch { '未知' }
+    $txtLog.AppendText("版本: $dshVer`r`n")
     try {
         Start-Dsh | Out-Null
         $script:openedBrowser = $false
@@ -854,15 +912,12 @@ $btnLog.Add_Click({
 
 # 手动刷新余额 / token
 $btnRefresh.Add_Click({
+    # 已在查询中就不重复发起
+    if ($script:usageProc -and -not $script:usageProc.HasExited) { return }
+    $btnRefresh.Text = '查询中…'
     $btnRefresh.Enabled = $false
-    $btnRefresh.Text = '…'
-    try {
-        Apply-Usage
-        $script:usageLoaded = $true
-    } catch { }
-    Start-Sleep -Milliseconds 300   # 避免连点
-    $btnRefresh.Text = '刷新'
-    $btnRefresh.Enabled = $true
+    Start-UsageQuery
+    # 结果由定时器轮询到后刷新界面，并在进程结束时恢复本按钮（不阻塞 UI）
 })
 
 # 充值：打开 DeepSeek 官方充值页（platform.deepseek.com/top_up）
@@ -909,7 +964,8 @@ $timer.Start()
 Update-Status
 Adopt-RunningDsh   # 认领当前已在运行的 dsh（若非本启动器启动），使停止/关窗行为一致
 Refresh-Log
-$script:usageTick = 12   # 让首次 tick 立即加载用量
+Start-UsageQuery   # 启动即刻发起一次用量查询（后台，不阻塞窗口显示）
+$script:usageTick = 0
 
 # 窗口定位：显示前按主屏工作区中心计算。
 # 不用 CenterScreen：多显示器 / 虚拟显示器（Todesk、MuMu 等）下它会把窗口

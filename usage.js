@@ -15,6 +15,14 @@ const CRED_FILE = path.join(DSH_HOME, '.credentials.yaml')
 const SESSIONS_DIR = path.join(DSH_HOME, 'sessions')
 const BALANCE_URL = 'https://api.deepseek.com/user/balance'
 
+// 结果文件路径（可选）：启动器传入，脚本原子写入该文件
+const OUT_PATH = process.argv[2] || null
+// token 汇总缓存：放在结果文件同目录，按会话文件 size+mtime 增量复用
+const CACHE_PATH = OUT_PATH
+  ? path.join(path.dirname(OUT_PATH), 'usage-cache.json')
+  : path.join(__dirname, 'usage-cache.json')
+const CACHE_VERSION = 1
+
 // ---- 读取 API key ----
 function readApiKey() {
   try {
@@ -76,7 +84,70 @@ function decompressJsonl(file) {
 // ---- 汇总 token 用量 ----
 // 与 token-meter 的 usage 投影一致：同一 turn/step 的后一个采样替换前一个，
 // 避免 usage 分块与最终 message 重复计数。
+//
+// 每个会话文件单独缓存（按 size+mtime 判断是否变化），只有新增/改动的会话才重新
+// 解压解析。sessions 目录可达上百 MB，全量解析要 7 秒以上；缓存后重复查询基本瞬时
+// 完成（启动器约每 10 秒查一次），也避免拖长单次运行时间导致被调用方超时杀掉。
+function readUsageCache() {
+  try {
+    const data = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8'))
+    if (data && data.version === CACHE_VERSION && data.files) return data.files
+  } catch (e) { /* 首次运行没有缓存 */ }
+  return {}
+}
+
+function writeUsageCache(files) {
+  try {
+    const tmp = CACHE_PATH + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify({ version: CACHE_VERSION, files }))
+    fs.renameSync(tmp, CACHE_PATH)
+  } catch (e) { /* 缓存写失败不影响本次结果 */ }
+}
+
+/** 解析一个会话日志，返回它的 token 分桶。 */
+function tokensOfSession(file) {
+  const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  const text = decompressJsonl(file)
+  const last = new Map() // turn:step -> buckets
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue
+    let ev
+    try { ev = JSON.parse(line) } catch (e) { continue }
+    let turn, step, usage
+    if (ev.type === 'assistant/chunk' && ev.data && ev.data.chunk && ev.data.chunk.type === 'usage') {
+      turn = ev.data.turn; step = ev.data.step; usage = ev.data.chunk.usage
+    } else if (ev.type === 'assistant/message' && ev.data && ev.data.usage) {
+      turn = ev.data.turn; step = ev.data.step; usage = ev.data.usage
+    } else {
+      continue
+    }
+    const buckets = {
+      input: usage.inputTokens || 0,
+      output: usage.outputTokens || 0,
+      cacheRead: usage.cacheReadTokens || 0,
+      cacheWrite: usage.cacheWriteTokens || 0,
+    }
+    const key = turn + ':' + step
+    const prev = last.get(key)
+    if (prev) {
+      totals.input += buckets.input - prev.input
+      totals.output += buckets.output - prev.output
+      totals.cacheRead += buckets.cacheRead - prev.cacheRead
+      totals.cacheWrite += buckets.cacheWrite - prev.cacheWrite
+    } else {
+      totals.input += buckets.input
+      totals.output += buckets.output
+      totals.cacheRead += buckets.cacheRead
+      totals.cacheWrite += buckets.cacheWrite
+    }
+    last.set(key, buckets)
+  }
+  return totals
+}
+
 function computeTokens() {
+  const cache = readUsageCache()
+  const nextCache = {}
   const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
   let sessionCount = 0
 
@@ -85,49 +156,31 @@ function computeTokens() {
     try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch (e) { return }
     for (const en of entries) {
       const p = path.join(dir, en.name)
-      if (en.isDirectory()) walk(p)
-      else if (en.name === 'session.jsonl.zstd') {
-        sessionCount++
-        const text = decompressJsonl(p)
-        const last = new Map() // turn:step -> buckets
-        for (const line of text.split('\n')) {
-          if (!line.trim()) continue
-          let ev
-          try { ev = JSON.parse(line) } catch (e) { continue }
-          let turn, step, usage
-          if (ev.type === 'assistant/chunk' && ev.data && ev.data.chunk && ev.data.chunk.type === 'usage') {
-            turn = ev.data.turn; step = ev.data.step; usage = ev.data.chunk.usage
-          } else if (ev.type === 'assistant/message' && ev.data && ev.data.usage) {
-            turn = ev.data.turn; step = ev.data.step; usage = ev.data.usage
-          } else {
-            continue
-          }
-          const buckets = {
-            input: usage.inputTokens || 0,
-            output: usage.outputTokens || 0,
-            cacheRead: usage.cacheReadTokens || 0,
-            cacheWrite: usage.cacheWriteTokens || 0,
-          }
-          const key = turn + ':' + step
-          const prev = last.get(key)
-          if (prev) {
-            totals.input += buckets.input - prev.input
-            totals.output += buckets.output - prev.output
-            totals.cacheRead += buckets.cacheRead - prev.cacheRead
-            totals.cacheWrite += buckets.cacheWrite - prev.cacheWrite
-          } else {
-            totals.input += buckets.input
-            totals.output += buckets.output
-            totals.cacheRead += buckets.cacheRead
-            totals.cacheWrite += buckets.cacheWrite
-          }
-          last.set(key, buckets)
-        }
+      if (en.isDirectory()) { walk(p); continue }
+      if (en.name !== 'session.jsonl.zstd') continue
+
+      let st = null
+      try { st = fs.statSync(p) } catch (e) { continue }
+      sessionCount++
+
+      const hit = cache[p]
+      let buckets
+      if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs && hit.buckets) {
+        buckets = hit.buckets
+      } else {
+        try { buckets = tokensOfSession(p) }
+        catch (e) { buckets = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }
       }
+      nextCache[p] = { size: st.size, mtimeMs: st.mtimeMs, buckets }
+      totals.input += buckets.input
+      totals.output += buckets.output
+      totals.cacheRead += buckets.cacheRead
+      totals.cacheWrite += buckets.cacheWrite
     }
   }
   walk(SESSIONS_DIR)
 
+  writeUsageCache(nextCache)
   totals.total = totals.input + totals.output + totals.cacheRead + totals.cacheWrite
   return { ...totals, sessions: sessionCount }
 }
@@ -150,44 +203,40 @@ async function fetchBalance(apiKey) {
   }
 }
 
-async function main() {
-  const result = { balance: null, tokens: null, error: null }
-  let tokens = null
-  try { tokens = computeTokens() } catch (e) { result.error = String(e && e.message || e) }
-  result.tokens = tokens
-
-  const apiKey = readApiKey()
-  if (apiKey) {
-    try { result.balance = await fetchBalance(apiKey) }
-    catch (e) { if (!result.error) result.error = String(e && e.message || e) }
-  } else if (!result.error) {
-    result.error = 'no api key'
-  }
-
+/** 原子写出结果（先写临时文件再改名），避免调用方读到半截 JSON。 */
+function writeResult(result) {
   const json = JSON.stringify(result)
-  // 若传入输出文件路径，则原子写入（先写临时文件再改名），避免 GUI 读到半截数据
-  const outPath = process.argv[2]
-  if (outPath) {
+  if (OUT_PATH) {
     try {
-      const tmp = outPath + '.tmp'
+      const tmp = OUT_PATH + '.tmp'
       fs.writeFileSync(tmp, json)
-      fs.renameSync(tmp, outPath)
+      fs.renameSync(tmp, OUT_PATH)
     } catch (e) { process.stdout.write(json) }
   } else {
     process.stdout.write(json)
   }
 }
 
-main().catch((err) => {
-  const json = JSON.stringify({ balance: null, tokens: null, error: String(err && err.message || err) })
-  const outPath = process.argv[2]
-  if (outPath) {
-    try {
-      const tmp = outPath + '.tmp'
-      fs.writeFileSync(tmp, json)
-      fs.renameSync(tmp, outPath)
-    } catch (e) { process.stdout.write(json) }
+async function main() {
+  const result = { balance: null, tokens: null, error: null }
+
+  // 先查余额并立即落盘：余额接口只要 ~0.3 秒，绝不能排在耗时的 token 汇总后面
+  // （会话日志上百 MB 时汇总要 7 秒以上，排在后面会让余额一起变慢/被超时打断）。
+  const apiKey = readApiKey()
+  if (apiKey) {
+    try { result.balance = await fetchBalance(apiKey) }
+    catch (e) { result.error = String(e && e.message || e) }
   } else {
-    process.stdout.write(json)
+    result.error = 'no api key'
   }
+  writeResult(result)
+
+  // 再汇总 token（有缓存，通常很快；首次或会话变动多时较慢）
+  try { result.tokens = computeTokens() }
+  catch (e) { if (!result.error) result.error = String(e && e.message || e) }
+  writeResult(result)
+}
+
+main().catch((err) => {
+  writeResult({ balance: null, tokens: null, error: String(err && err.message || err) })
 })
